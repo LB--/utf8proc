@@ -315,6 +315,54 @@ typedef struct utf8proc_property_struct {
   unsigned indic_conjunct_break:2;
 } utf8proc_property_t;
 
+/** Struct for a read-only view of a UTF-8 string. A len of -1 means null-terminated. */
+typedef struct utf8proc_string8_view_struct {
+  const utf8proc_uint8_t *ptr;
+  utf8proc_ssize_t len;
+} utf8proc_string8_view_t;
+
+/**
+* Struct for a read-write view of a buffer of Unicode code points.
+* The len_* fields must be nonnegative and len_available must always
+* be greater than or equal to len_used.
+*/
+typedef struct utf8proc_span32_struct {
+	utf8proc_int32_t *ptr;
+	utf8proc_ssize_t len_used, len_available;
+} utf8proc_span32_t;
+
+/**
+* Struct containing information about a string in processing.
+* Used for re-entrant processing algorithms such as
+* @ref utf8proc_isequal_normalized
+*/
+typedef struct utf8proc_processing_state_struct {
+  /**
+  * The source UTF-8 string which is being processed.
+  * When processing is halted for any reason, this will be updated
+  * to the remainder of the string which hasn't yet been processed.
+  * This will become an empty string once fully processed.
+  */
+  utf8proc_string8_view_t str;
+  /**
+  * A temporary work buffer used during processing, generally
+  * for holding and sorting combining characters. Depending
+  * on `str` contents, this may need to be dynamically reallocated.
+  * In that case, `buf.ptr` is set to NULL and `buf.len_used` is
+  * updated to the minimum required length (as far as can be known
+  * before other errors stop processing) while `buf.len_available`
+  * is left untouched for comparison. The contents of this buffer
+  * are arbitrary and do not need to be cleared nor preserved, so
+  * the space can be re-used across multiple processing attempts.
+  */
+  utf8proc_span32_t buf;
+  /**
+  * Any error from string processing. This is set to 0 when processing
+  * starts and left untouched unless there is an error.
+  */
+  utf8proc_ssize_t error;
+} utf8proc_processing_state_t;
+
 /** Unicode categories. */
 typedef enum {
   UTF8PROC_CATEGORY_CN  = 0, /**< Other, not assigned */
@@ -786,6 +834,35 @@ UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_NFKC(const utf8proc_uint8_t *str);
  **/
 UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_NFKC_Casefold(const utf8proc_uint8_t *str);
 /** @} */
+
+/**
+* Re-entrant algorithm for efficiently comparing two strings for equality
+* while ignoring differences in Unicode normalization. If a mismatch is
+* found or an error occurs, the `str` members are updated to the remainder
+* of each string, starting with the culprit(s). If the strings are equal,
+* both `str` members will become empty.
+*
+* As noted on @ref utf8proc_processing_state_t the `buf.ptr` member will be
+* NULL if the provided buffer is too small, consult `buf.len_used` to see that
+* it is greater than `buf.len_available` and re-allocate as needed to satisfy
+* the requirement. The `buf` buffers must not overlap, but they may coexist
+* within a single memory allocation if desired, just just must be properly
+* aligned in accordance with the alignment requirements of utf8proc_int32_t.
+*
+* Note also that because the `str` members are updated, you can resume comparing
+* the string from where you left off after growing the `buf` buffers or fixing
+* erroneous UTF-8 sequences, so there's no wasteful re-processing of parts of
+* the string that have already been deemed equivalent.
+*
+* You can also use this function for finding the longest common starting
+* sequence, and you can apply your own methodology for handling or skipping
+* over invalid UTF-8 sequences found in each provided string.
+*
+* @param custom_func Optional, see @ref utf8proc_custom_func for info.
+*/
+UTF8PROC_DLLEXPORT void utf8proc_isequal_normalized(utf8proc_processing_state_t *a, utf8proc_processing_state_t *b, utf8proc_option_t options,
+  utf8proc_custom_func custom_func, void *custom_data
+);
 
 #ifdef __cplusplus
 }

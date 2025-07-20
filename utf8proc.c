@@ -822,3 +822,180 @@ UTF8PROC_DLLEXPORT utf8proc_uint8_t *utf8proc_NFKC_Casefold(const utf8proc_uint8
     UTF8PROC_COMPOSE | UTF8PROC_COMPAT | UTF8PROC_CASEFOLD | UTF8PROC_IGNORE);
   return retval;
 }
+
+/**
+* Helper function used by utf8proc_isequal_normalized.
+* Reads and sorts the next sequence of combining characters.
+* If buf is not large enough, calculates minimum length by processing
+* the whole rest of the string instead of just the next combining characters.
+*/
+static void utf8proc_decompose_next_chars(utf8proc_processing_state_t *state, const utf8proc_option_t options,
+  utf8proc_custom_func custom_func, void *custom_data
+) {
+  utf8proc_ssize_t buf_needed = 0, buf_needed_max = 1;
+  utf8proc_span32_t buf_remaining = state->buf;
+  int last_boundclass = 0;
+  state->error = 0;
+  while (state->str.len > 0) {
+    /* read a char from `state->str` and decompose it to `buf_remaining` */
+    utf8proc_int32_t c;
+    utf8proc_ssize_t str_consumed, buf_consumed;
+    str_consumed = utf8proc_iterate(state->str.ptr, state->str.len, &c);
+    if (str_consumed < 1) {
+      /* error or end of string */
+      state->error = str_consumed;
+      return;
+    } else if (str_consumed > state->str.len) {
+      /* string ends mid-way */
+      state->error = UTF8PROC_ERROR_INVALIDUTF8;
+      return;
+    }
+    if (custom_func) {
+      c = custom_func(c, custom_data);
+    }
+	/* successfully read from `state->str`, now time to decompose */
+    if (c < 0x80) {
+      /* fast path for common ASCII case */
+      last_boundclass = 0;
+      if (state->error != 0) {
+        /* just looking for the longest combining sequence, this isn't it */
+        continue;
+      }
+      if (buf_remaining.len_available < 1) {
+        /* not enough space */
+        buf_remaining.len_available = 0;
+        state->buf.ptr = buf_remaining.ptr = NULL;
+        state->error = UTF8PROC_ERROR_NOMEM;
+        /* now just looking for the longest combining sequence, this isn't it */
+        continue;
+      }
+      /* success */
+      buf_consumed = buf_needed = 1;
+      if ((options & UTF8PROC_CASEFOLD) && 0x41 <= c && c <= 0x5A) {
+        *buf_remaining.ptr = c + 0x20;
+      } else {
+        *buf_remaining.ptr = c;
+      }
+      state->str.ptr += str_consumed;
+      state->str.len -= str_consumed;
+      buf_remaining.ptr += 1;
+      buf_remaining.len_available -= 1;
+      /* ASCII characters are all zero combining class */
+      break;
+    } else {
+      buf_consumed = utf8proc_decompose_char(c, buf_remaining.ptr, buf_remaining.len_available, options, &last_boundclass);
+      if (buf_consumed < 0) {
+        /* error */
+        state->error = buf_consumed;
+        return;
+      }
+      buf_needed += buf_consumed;
+      if (state->error == 0 && buf_consumed > buf_remaining.len_available) {
+        /* not enough space */
+        buf_remaining.len_available = 0;
+        state->buf.ptr = buf_remaining.ptr = NULL;
+        state->error = UTF8PROC_ERROR_NOMEM;
+      }
+    }
+    /* success */
+    state->str.ptr += str_consumed;
+    state->str.len -= str_consumed;
+    if (buf_needed == 0) {
+      /* ignorable sequence - skip and try next */
+      continue;
+    }
+    if (state->error == 0) {
+      buf_remaining.ptr += buf_consumed;
+      buf_remaining.len_available -= buf_consumed;
+    }
+    /* decomposed chars must be sorted in ascending order of combining class,
+       which means we need to keep fetching chars until we get to non-combining */
+    if (buf_consumed == 0 || state->str.len <= 0 || unsafe_get_property(c)->combining_class == 0) {
+      /* done decomposing this sequence */
+      if (state->error == 0) {
+        /* time to finish up and optionally sort it */
+        break;
+      }
+      /* else we're trying to find the longest decomposed sequence */
+      if (buf_needed > buf_needed_max) {
+        buf_needed_max = buf_needed;
+      }
+      /* reset for next sequence */
+      buf_needed = 0;
+    }
+  }
+  if (state->buf.ptr == NULL) {
+    state->buf.len_used = buf_needed_max;
+  } else {
+    state->buf.len_used = buf_needed;
+  }
+  if (buf_needed > 1 && state->error == 0 && buf_needed <= state->buf.len_available) {
+    /* sort by combining class (similar code is in utf8proc_decompose_custom implementation) */
+    utf8proc_ssize_t pos = 0;
+    const utf8proc_ssize_t second_to_last = buf_needed - 1;
+    while (pos < second_to_last) {
+      utf8proc_int32_t uc1, uc2;
+      const utf8proc_property_t *property1, *property2;
+      uc1 = state->buf.ptr[pos];
+      uc2 = state->buf.ptr[pos+1];
+      property1 = unsafe_get_property(uc1);
+      property2 = unsafe_get_property(uc2);
+      if (property1->combining_class > property2->combining_class &&
+          property2->combining_class > 0) {
+        state->buf.ptr[pos] = uc2;
+        state->buf.ptr[pos+1] = uc1;
+        if (pos > 0) pos--; else pos++;
+      } else {
+        pos++;
+      }
+    }
+  }
+}
+
+static utf8proc_string8_view_t utf8proc_purify_strlen(utf8proc_string8_view_t str) {
+  if (str.len < 0) {
+    if(str.ptr == NULL) {
+      str.len = 0;
+    }
+    else for(str.len = 0; str.ptr[str.len] != '\0'; ++str.len) { }
+  }
+  return str;
+}
+
+UTF8PROC_DLLEXPORT void utf8proc_isequal_normalized(utf8proc_processing_state_t *a, utf8proc_processing_state_t *b, utf8proc_option_t options,
+  utf8proc_custom_func custom_func, void *custom_data
+) {
+  a->str = utf8proc_purify_strlen(a->str);
+  b->str = utf8proc_purify_strlen(b->str);
+  options = (utf8proc_option_t)((options & ~(unsigned int)UTF8PROC_COMPOSE)|UTF8PROC_DECOMPOSE);
+  while (1) {
+    const utf8proc_string8_view_t original_a = a->str;
+    const utf8proc_string8_view_t original_b = b->str;
+    if(a->str.len == 0 || b->str.len == 0) {
+      /* end of string */
+      return;
+    }
+    utf8proc_decompose_next_chars(a, options, custom_func, custom_data);
+    utf8proc_decompose_next_chars(b, options, custom_func, custom_data);
+    if (a->error == 0 && b->error == 0) {
+      utf8proc_ssize_t pos;
+      /* success - compare the work buffers for equality */
+      if (a->buf.len_used != b->buf.len_used) {
+        /* mismatch found */
+        return;
+      }
+      for(pos = 0; pos < a->buf.len_used; ++pos) {
+        if(a->buf.ptr[pos] != b->buf.ptr[pos]) {
+          /* mismatch found */
+          return;
+        }
+      }
+      /* equal so far */
+      continue;
+    }
+    /* error - restore unprocessed strings and exit */
+    a->str = original_a;
+    b->str = original_b;
+    return;
+  }
+}
